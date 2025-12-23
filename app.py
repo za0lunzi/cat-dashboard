@@ -1,218 +1,347 @@
+import os
+from pathlib import Path
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 
-from rules import add_impact_severity, add_phenomenon_type, add_user_journey_view
+st.set_page_config(page_title="MVP Definer (MoSCoW)", layout="wide")
 
-st.set_page_config(page_title="竞品洞察 & MVP 决策看板", layout="wide")
+# =========================
+# Config / Column Map
+# =========================
+REPO_DEFAULT_XLSX = "cat_litter_labelled_comments_merged.xlsx"
 
-@st.cache_data
-def load_data(path: str) -> pd.DataFrame:
-    df = pd.read_excel(path)
-    df.columns = [str(c).strip() for c in df.columns]
+# 你数据里如果列名不同，在这里改映射即可
+COL = {
+    "issue": "Issue_L2",
+    "severity": "Impact_Severity",         # Critical / Failure / Annoyance / Minor
+    "phenom": "Phenomenon_Type",           # Defect / Friction / Constraint (你也可以有 Delighter/Positive)
+    "review_id": None,                     # 如果有 Review_ID，填列名；没有就用每行当一条记录
+    "quote": "Review_Text",                # 可选：原文/摘要列名（没有也能跑）
+    "subject": "Subject",                  # 可选：分群字段
+    "context": "Context",                  # 可选
+    "household": "Household",              # 可选
+    "phase": "Interaction_Phase",          # 可选
+}
 
-    # 基础清洗
-    for col in ["comment_id","text","Interaction_Phase","Object","Issue",
-                "Root_Cause_Context","Feedback_Type","Sentiment",
-                "Subject","Context","Household"]:
-        if col not in df.columns:
-            df[col] = "Unknown"
-        df[col] = df[col].fillna("Unknown")
+SEVERITY_WEIGHT = {
+    "Critical": 10,
+    "Failure": 5,
+    "Annoyance": 1,
+    "Minor": 0,
+}
 
-    df = add_impact_severity(df)
-    df = add_phenomenon_type(df)
-    df = add_user_journey_view(df)
+P0_THRESHOLD = 0.50
+NOISE_MINOR_THRESHOLD = 0.90
+NOISE_CRITICAL_THRESHOLD = 0.05
 
-    # 标准化为字符串（避免筛选器出错）
-    for col in ["Interaction_Phase","Object","Issue","Root_Cause_Context","Feedback_Type",
-                "Impact_Severity","Phenomenon_Type","Subject","Context","Household","User_Journey_View"]:
-        df[col] = df[col].astype(str)
+# =========================
+# Helpers
+# =========================
+def _norm_str(x):
+    if pd.isna(x):
+        return ""
+    return str(x).strip()
+
+def _ensure_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # 标准化字符串列
+    for k in ["issue", "severity", "phenom", "quote", "subject", "context", "household", "phase"]:
+        col = COL.get(k)
+        if col and col in df.columns:
+            df[col] = df[col].map(_norm_str)
+
+    # 必需列检查
+    required = [COL["issue"], COL["severity"], COL["phenom"]]
+    missing = [c for c in required if c not in df.columns]
+    if missing:
+        st.error(
+            "缺少必需列，当前缺少：\n"
+            + "\n".join([f"- {c}" for c in missing])
+            + "\n\n请确认你的表里至少有：Issue_L2 / Impact_Severity / Phenomenon_Type（或在 COL 映射里改成你的列名）"
+        )
+        st.stop()
+
+    # severity 统一大小写
+    df[COL["severity"]] = df[COL["severity"]].str.title()
+
+    # 只保留我们认识的 severity；其余标为 Minor(0) 或直接丢弃，这里选择：丢弃
+    df = df[df[COL["severity"]].isin(SEVERITY_WEIGHT.keys())].copy()
 
     return df
 
-df = load_data("cat_litter_labelled_comments_merged.xlsx")
+def _get_total_reviews(df: pd.DataFrame) -> int:
+    # 如果有 review_id 列，用唯一 review 数；否则默认一行=一条 insight/review
+    rid = COL.get("review_id")
+    if rid and rid in df.columns:
+        return df[rid].nunique()
+    return len(df)
 
-st.title("竞品洞察与 MoSCoW 战略决策看板（一次性猫砂盆）")
-st.caption("原则：任何结论必须能回溯到原评论（Evidence）。")
-
-# -----------------------
-# 全局筛选器
-# -----------------------
-with st.sidebar:
-    st.header("全局筛选器")
-
-    subject = st.multiselect("Subject", sorted(df["Subject"].unique()))
-    context = st.multiselect("Context", sorted(df["Context"].unique()))
-    household = st.multiselect("Household", sorted(df["Household"].unique()))
-    phase = st.multiselect("Interaction_Phase", sorted(df["Interaction_Phase"].unique()))
-
-    sev = st.multiselect(
-        "Impact_Severity",
-        ["Critical","Major","Minor","Positive","Delighter","Unknown"],
-        default=["Critical","Major","Positive","Delighter"]
+def _severity_dist(df: pd.DataFrame) -> pd.DataFrame:
+    # per issue severity distribution
+    issue = COL["issue"]
+    sev = COL["severity"]
+    pivot = (
+        df.pivot_table(index=issue, columns=sev, values=sev, aggfunc="count", fill_value=0)
+        .reset_index()
     )
-    ptype = st.multiselect("Phenomenon_Type", ["Defect","Constraint","Unclear"], default=["Defect","Constraint","Unclear"])
+    for s in SEVERITY_WEIGHT.keys():
+        if s not in pivot.columns:
+            pivot[s] = 0
+    pivot["Total_Issue_Occurrences"] = pivot[list(SEVERITY_WEIGHT.keys())].sum(axis=1)
+    # shares
+    for s in SEVERITY_WEIGHT.keys():
+        pivot[f"{s}_share"] = pivot[s] / pivot["Total_Issue_Occurrences"].clip(lower=1)
+    pivot["CriticalFailure_share"] = (pivot["Critical"] + pivot["Failure"]) / pivot["Total_Issue_Occurrences"].clip(lower=1)
+    return pivot
 
-    fdf = df.copy()
-    if subject: fdf = fdf[fdf["Subject"].isin(subject)]
-    if context: fdf = fdf[fdf["Context"].isin(context)]
-    if household: fdf = fdf[fdf["Household"].isin(household)]
-    if phase: fdf = fdf[fdf["Interaction_Phase"].isin(phase)]
-    if sev: fdf = fdf[fdf["Impact_Severity"].isin(sev)]
-    if ptype: fdf = fdf[fdf["Phenomenon_Type"].isin(ptype)]
+def _compute_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    issue = COL["issue"]
+    sev = COL["severity"]
+    phen = COL["phenom"]
 
-st.write(f"当前筛选后：**N={len(fdf)}** 行 insight（全量 N={len(df)}）")
+    total_reviews = _get_total_reviews(df)
 
-# -----------------------
-# Tabs
-# -----------------------
-tab1, tab2, tab3, tab4, tab5 = st.tabs(["A 生死线", "B 机会点", "C 细分战场", "D 丢弃体验", "E 证据面板"])
+    df = df.copy()
+    df["sev_weight"] = df[sev].map(SEVERITY_WEIGHT).fillna(0)
 
-# 用 session_state 保存“点击后要看的 evidence 条件”
-if "evidence_filter" not in st.session_state:
-    st.session_state.evidence_filter = {}
+    # prevalence: issue count / total reviews
+    issue_counts = df.groupby(issue, as_index=False).size().rename(columns={"size": "Issue_Count"})
+    issue_counts["Prevalence"] = issue_counts["Issue_Count"] / max(total_reviews, 1)
 
-def set_evidence(obj=None, issue=None, extra=None):
-    filt = {}
-    if obj is not None: filt["Object"] = obj
-    if issue is not None: filt["Issue"] = issue
-    if extra:
-        filt.update(extra)
-    st.session_state.evidence_filter = filt
+    # pain index: avg weighted severity
+    pain = df.groupby(issue, as_index=False)["sev_weight"].mean().rename(columns={"sev_weight": "Pain_Index"})
 
-with tab1:
-    st.subheader("A｜生死线视图（Critical/Major + Defect）")
-    sdf = fdf[(fdf["Phenomenon_Type"]=="Defect") & (fdf["Impact_Severity"].isin(["Critical","Major"]))]
+    # top phenomenon type for issue (mode)
+    def _mode(s):
+        if len(s) == 0:
+            return ""
+        return s.value_counts().index[0]
 
-    c1, c2 = st.columns([1,1])
+    phen_mode = df.groupby(issue)[phen].apply(_mode).reset_index().rename(columns={phen: "Phenomenon_Mode"})
 
-    with c1:
-        killers = (sdf.groupby(["Object","Issue"]).size().reset_index(name="N")
-                   .sort_values("N", ascending=False).head(20))
-        killers["Key"] = killers["Object"].astype(str) + " | " + killers["Issue"].astype(str)
+    # severity dist for rules
+    dist = _severity_dist(df)
 
-        fig = px.bar(killers, x="N", y="Key", orientation="h", title="Top Killers（Object | Issue）")
-        st.plotly_chart(fig, use_container_width=True)
+    out = issue_counts.merge(pain, on=issue, how="left").merge(phen_mode, on=issue, how="left").merge(dist, on=issue, how="left")
+    out["Pain_Index"] = out["Pain_Index"].fillna(0)
 
-        st.markdown("点击下方表格任意行 → 跳到证据面板")
-        st.dataframe(killers, use_container_width=True, hide_index=True)
-        # 选择一行做 evidence（小白友好：用下拉）
-        if len(killers) > 0:
-            idx = st.selectbox("选择一个 Killer 查看证据", killers.index.tolist(), format_func=lambda i: killers.loc[i,"Key"])
-            if st.button("查看证据（Killer）"):
-                set_evidence(obj=killers.loc[idx,"Object"], issue=killers.loc[idx,"Issue"], extra={"View":"Survival"})
-                st.success("已设置证据筛选，请切换到 Tab E 证据面板。")
+    # Decision flags
+    out["P0_Blocker"] = out["CriticalFailure_share"] >= P0_THRESHOLD
+    out["Noise"] = (out["Minor_share"] >= NOISE_MINOR_THRESHOLD) & (out["Critical_share"] <= NOISE_CRITICAL_THRESHOLD)
 
-    with c2:
-        by_phase = sdf.groupby("Interaction_Phase").size().reset_index(name="N").sort_values("N", ascending=False)
-        fig2 = px.bar(by_phase, x="Interaction_Phase", y="N", title="缺陷发生阶段分布")
-        st.plotly_chart(fig2, use_container_width=True)
+    # P1 heuristic: annoyance 高但 critical 很低
+    # 这里给默认阈值，可在 UI 调整
+    out["P1_Optimize"] = (out["Annoyance_share"] >= 0.50) & (out["Critical_share"] <= 0.05)
 
+    # Display label
+    def _label(row):
+        if row["Noise"]:
+            return "Noise"
+        if row["P0_Blocker"]:
+            return "P0"
+        if row["P1_Optimize"]:
+            return "P1"
+        return "P2"
 
-with tab2:
-    st.subheader("B｜机会点视图（Delighter/Positive）")
-    odf = fdf[fdf["Impact_Severity"].isin(["Delighter","Positive"])]
+    out["Priority"] = out.apply(_label, axis=1)
 
-    c1, c2 = st.columns([1,1])
+    return out, total_reviews
 
-    with c1:
-        hooks = (odf.groupby(["Object","Issue"]).size().reset_index(name="N")
-                 .sort_values("N", ascending=False).head(20))
-        hooks["Key"] = hooks["Object"].astype(str) + " | " + hooks["Issue"].astype(str)
-        fig = px.bar(hooks, x="N", y="Key", orientation="h", title="Top Hooks（用户最夸赞）")
-        st.plotly_chart(fig, use_container_width=True)
+def _filter_df(df_raw: pd.DataFrame, filters: dict) -> pd.DataFrame:
+    df = df_raw.copy()
+    # optional segment filters
+    for key in ["subject", "context", "household", "phase"]:
+        col = COL.get(key)
+        if col and col in df.columns:
+            chosen = filters.get(key, [])
+            if chosen:
+                df = df[df[col].isin(chosen)].copy()
+    return df
 
-        if len(hooks) > 0:
-            idx = st.selectbox("选择一个 Hook 查看证据", hooks.index.tolist(), format_func=lambda i: hooks.loc[i,"Key"], key="hook_select")
-            if st.button("查看证据（Hook）"):
-                set_evidence(obj=hooks.loc[idx,"Object"], issue=hooks.loc[idx,"Issue"], extra={"View":"Opportunity"})
-                st.success("已设置证据筛选，请切换到 Tab E 证据面板。")
+def _build_markdown_prd(df_raw: pd.DataFrame, chosen_issues: list, title: str) -> str:
+    issue_col = COL["issue"]
+    sev_col = COL["severity"]
+    phen_col = COL["phenom"]
+    quote_col = COL.get("quote")
 
-    with c2:
-        by_phase = odf.groupby("Interaction_Phase").size().reset_index(name="N").sort_values("N", ascending=False)
-        fig2 = px.bar(by_phase, x="Interaction_Phase", y="N", title="正向体验发生阶段")
-        st.plotly_chart(fig2, use_container_width=True)
+    lines = []
+    lines.append(f"# {title}\n")
+    lines.append("## Must-have / Selected Issues\n")
 
+    for i, iss in enumerate(chosen_issues, start=1):
+        sub = df_raw[df_raw[issue_col] == iss].copy()
+        if sub.empty:
+            continue
+        # frequency
+        freq = len(sub)
+        # severity dist
+        sev_counts = sub[sev_col].value_counts().to_dict()
+        cf_share = (sev_counts.get("Critical", 0) + sev_counts.get("Failure", 0)) / max(freq, 1)
+        # phenomenon
+        phen = sub[phen_col].value_counts().index[0] if len(sub) else ""
 
-with tab3:
-    st.subheader("C｜细分战场视图（S-C-H 放大）")
-    issue_list = sorted(fdf["Issue"].unique())
-    focus_issue = st.selectbox("选择要观察的 Issue", issue_list)
+        lines.append(f"### {i}. {iss}")
+        lines.append(f"- Phenomenon_Type: **{phen}**")
+        lines.append(f"- Frequency (rows): **{freq}**")
+        lines.append(f"- Critical+Failure share: **{cf_share:.0%}**")
+        lines.append(f"- Severity breakdown: {', '.join([f'{k}:{v}' for k,v in sev_counts.items()])}")
 
-    base = fdf.copy()
-    base["is_focus"] = (base["Issue"] == focus_issue).astype(int)
+        # representative quotes (optional)
+        if quote_col and quote_col in sub.columns:
+            quotes = [q for q in sub[quote_col].dropna().astype(str).tolist() if q.strip()]
+            quotes = quotes[:5]
+            if quotes:
+                lines.append("- Representative quotes:")
+                for q in quotes:
+                    lines.append(f"  - {q}")
 
-    # 全局占比
-    global_share = base["is_focus"].mean() if len(base) else 0.0
-    st.metric("全局占比（该 Issue）", f"{global_share:.2%}")
+        lines.append("")  # blank line
 
-    # Subject 放大
-    pivot = (base.groupby("Subject")["is_focus"].mean().reset_index(name="Share"))
-    pivot["Lift"] = pivot["Share"] / (global_share if global_share > 0 else 1.0)
+    return "\n".join(lines)
 
-    fig = px.bar(pivot, x="Subject", y="Share", title=f"{focus_issue} 在不同 Subject 的占比")
+# =========================
+# UI
+# =========================
+st.title("MoSCoW 动态定义阵列（个人决策外挂）")
+st.caption("目标：用最少的图回答：MVP 必须包含什么 / 资源投向哪里 / 哪些问题属于噪音或可接受的 trade-off")
+
+with st.sidebar:
+    st.header("数据源")
+    uploaded = st.file_uploader("上传 Excel（可选）", type=["xlsx"])
+    use_default = st.toggle(f"使用仓库内默认文件：{REPO_DEFAULT_XLSX}", value=True if not uploaded else False)
+
+    st.divider()
+    st.header("筛选器（可选）")
+
+@st.cache_data(show_spinner=False)
+def load_df_from_xlsx(path: str) -> pd.DataFrame:
+    return pd.read_excel(path)
+
+@st.cache_data(show_spinner=False)
+def load_df_from_uploaded(file) -> pd.DataFrame:
+    return pd.read_excel(file)
+
+# Load data
+if uploaded is not None and not use_default:
+    df0 = load_df_from_uploaded(uploaded)
+else:
+    default_path = Path(__file__).parent / REPO_DEFAULT_XLSX
+    if not default_path.exists():
+        st.error(f"找不到默认文件：{REPO_DEFAULT_XLSX}。请上传 Excel 或把文件放到 repo 根目录。")
+        st.stop()
+    df0 = load_df_from_xlsx(str(default_path))
+
+df0 = _ensure_columns(df0)
+
+# Build filter choices
+filters = {}
+with st.sidebar:
+    for key, label in [("subject", "Subject"), ("context", "Context"), ("household", "Household"), ("phase", "Interaction_Phase")]:
+        col = COL.get(key)
+        if col and col in df0.columns:
+            options = sorted([x for x in df0[col].dropna().unique().tolist() if str(x).strip()])
+            chosen = st.multiselect(label, options, default=[])
+            filters[key] = chosen
+
+df = _filter_df(df0, filters)
+
+metrics, total_reviews = _compute_metrics(df)
+
+# Controls
+with st.sidebar:
+    st.divider()
+    st.header("阈值（Must-Have 切割）")
+
+    min_prev = st.slider("Min_Frequency（Prevalence）", 0.0, 0.50, 0.02, 0.005)
+    min_pain = st.slider("Min_Severity（Pain Index）", 0.0, 10.0, 2.0, 0.1)
+
+    st.caption("解释：Prevalence=该 Issue 出现次数 / 总评论（或总行数）；Pain Index=按 Critical/Failure/Annoyance/Minor 加权的平均痛苦指数")
+
+# Apply rule-based filtering
+must_have = metrics[
+    (~metrics["Noise"]) &
+    (metrics["Prevalence"] >= min_prev) &
+    (metrics["Pain_Index"] >= min_pain)
+].copy()
+
+# Main layout
+colA, colB = st.columns([2, 1], gap="large")
+
+with colA:
+    st.subheader("MoSCoW 散点（Issue 粒度）")
+
+    plot_df = metrics.copy()
+    plot_df["Phenomenon_Mode"] = plot_df["Phenomenon_Mode"].replace("", "Unknown")
+
+    # 优先级用符号区分
+    symbol_map = {"P0": "diamond", "P1": "circle", "P2": "square", "Noise": "x"}
+    plot_df["symbol"] = plot_df["Priority"].map(symbol_map).fillna("circle")
+
+    fig = px.scatter(
+        plot_df,
+        x="Prevalence",
+        y="Pain_Index",
+        color="Phenomenon_Mode",
+        symbol="Priority",
+        hover_data={
+            COL["issue"]: True,
+            "Issue_Count": True,
+            "Prevalence": ":.2%",
+            "Pain_Index": ":.2f",
+            "CriticalFailure_share": ":.0%",
+            "Priority": True,
+            "Noise": True,
+        },
+        title="X=普遍性(Prevalence)，Y=痛苦指数(Pain Index)，颜色=Phenomenon_Type(Mode)，符号=优先级(P0/P1/P2/Noise)"
+    )
+    # Must-have 区域辅助线
+    fig.add_vline(x=min_prev, line_dash="dash")
+    fig.add_hline(y=min_pain, line_dash="dash")
+
     st.plotly_chart(fig, use_container_width=True)
 
-    st.dataframe(pivot.sort_values("Lift", ascending=False), use_container_width=True, hide_index=True)
+    st.info(f"总评论基数（分母）：{total_reviews} ；当前 Issue 数：{len(metrics)} ；Must-Have（按阈值）={len(must_have)}")
 
-    # 选择一个 Subject 查看证据
-    if len(pivot) > 0:
-        subj = st.selectbox("选择一个 Subject 查看该 Issue 的证据", pivot["Subject"].tolist())
-        if st.button("查看证据（Niche）"):
-            set_evidence(obj=None, issue=focus_issue, extra={"Subject": subj, "View":"Niche"})
-            st.success("已设置证据筛选，请切换到 Tab E 证据面板。")
+with colB:
+    st.subheader("Must-Have 列表（可导出 PRD）")
 
+    # 给你一个“个人用”最稳的选择方式：多选 Issue（不依赖 plotly 选择事件）
+    must_issue_options = must_have[COL["issue"]].tolist()
+    chosen = st.multiselect("选择要导出的 Issues（默认：全部 Must-Have）", options=must_issue_options, default=must_issue_options)
 
-with tab4:
-    st.subheader("D｜丢弃体验视图（派生：User_Journey_View = Disposal）")
-    ddf = fdf[fdf["User_Journey_View"]=="Disposal"]
+    st.markdown("**快速结论（用于你自己决策）**")
+    p0_cnt = int((must_have["Priority"] == "P0").sum())
+    p1_cnt = int((must_have["Priority"] == "P1").sum())
+    st.write(f"- Must-Have 中 P0（Critical+Failure≥50%）: **{p0_cnt}**")
+    st.write(f"- Must-Have 中 P1（Annoyance 高、Critical 低）: **{p1_cnt}**")
+    st.write(f"- 已识别 Noise（默认不纳入 Must-Have）: **{int(metrics['Noise'].sum())}**")
 
-    c1, c2 = st.columns([1,1])
+    # 展示表格
+    show_cols = [
+        COL["issue"], "Prevalence", "Pain_Index", "Phenomenon_Mode",
+        "CriticalFailure_share", "Priority", "Issue_Count"
+    ]
+    st.dataframe(
+        must_have[show_cols].sort_values(["Priority", "Pain_Index", "Prevalence"], ascending=[True, False, False]),
+        use_container_width=True,
+        height=420
+    )
 
-    with c1:
-        st.write("Disposal 规模")
-        share = len(ddf) / len(fdf) if len(fdf) else 0
-        st.metric("Disposal 占比（在当前筛选内）", f"{share:.2%}", help="Maintenance/Durability 中含丢弃/搬运/倒砂语义的 insight")
-        by_phase = ddf.groupby("Interaction_Phase").size().reset_index(name="N").sort_values("N", ascending=False)
-        st.plotly_chart(px.bar(by_phase, x="Interaction_Phase", y="N", title="Disposal 分布（原始 Phase）"), use_container_width=True)
+    st.divider()
+    title = st.text_input("PRD 标题", value="MVP Must-Have 清单（从 MoSCoW 阈值导出）")
+    md = _build_markdown_prd(df_raw=df, chosen_issues=chosen, title=title)
 
-    with c2:
-        top = (ddf.groupby(["Object","Issue"]).size().reset_index(name="N")
-               .sort_values("N", ascending=False).head(20))
-        top["Key"] = top["Object"].astype(str) + " | " + top["Issue"].astype(str)
-        st.plotly_chart(px.bar(top, x="N", y="Key", orientation="h", title="Disposal Top Issues（Object | Issue）"),
-                        use_container_width=True)
+    st.download_button(
+        "下载 PRD（Markdown）",
+        data=md.encode("utf-8"),
+        file_name="mvp_prd.md",
+        mime="text/markdown"
+    )
 
-        if len(top) > 0:
-            idx = st.selectbox("选择一个 Disposal 问题查看证据", top.index.tolist(), format_func=lambda i: top.loc[i,"Key"], key="disposal_select")
-            if st.button("查看证据（Disposal）"):
-                set_evidence(obj=top.loc[idx,"Object"], issue=top.loc[idx,"Issue"], extra={"View":"Disposal"})
-                st.success("已设置证据筛选，请切换到 Tab E 证据面板。")
-
-
-with tab5:
-    st.subheader("E｜证据面板（原评论回溯）")
-    ef = fdf.copy()
-    filt = st.session_state.evidence_filter or {}
-
-    st.write("当前证据筛选条件：", filt if filt else "（未选择，使用当前全局筛选）")
-
-    # 应用证据条件
-    if "Object" in filt:
-        ef = ef[ef["Object"] == filt["Object"]]
-    if "Issue" in filt:
-        ef = ef[ef["Issue"] == filt["Issue"]]
-    if "Subject" in filt:
-        ef = ef[ef["Subject"] == filt["Subject"]]
-
-    # 去重：同 comment_id 的多行 insight 合并展示（避免刷屏）
-    cols = ["comment_id","text","Interaction_Phase","Object","Issue",
-            "Root_Cause_Context","Feedback_Type",
-            "Impact_Severity","Phenomenon_Type",
-            "Subject","Context","Household","User_Journey_View"]
-    ef_show = ef[cols].drop_duplicates(subset=["comment_id"])
-
-    st.write(f"证据评论数（去重后）：**{len(ef_show)}**")
-    st.dataframe(ef_show.head(50), use_container_width=True, hide_index=True)
-
-    st.markdown("**提示**：如果你想快速做“故事地图”，就在这里复制 Top 10 条原评论。")
+# Data QA section
+with st.expander("数据 QA / 列名检查（点开看看，避免之后讨论跑偏）", expanded=False):
+    st.write("当前列名：", list(df0.columns))
+    st.write("当前映射 COL：", COL)
+    st.write("Severity 权重：", SEVERITY_WEIGHT)
+    st.write("P0 阈值 Critical+Failure≥：", P0_THRESHOLD)
+    st.write("Noise 规则：Minor≥90% 且 Critical≤5%（默认）")
